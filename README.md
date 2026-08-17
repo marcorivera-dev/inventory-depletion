@@ -8,7 +8,8 @@ Automatically deducts ingredient inventory every night, based on that day's sale
 > Extracted from a larger inventory system (orders, kitchen, payments, loyalty). This repo only
 > carries the depletion piece: the recipe → ingredient model, the nightly scheduler, and the
 > critical-level alert. The recipe and ingredient catalog in `recipes.js` / `ingredients.js` is a
-> sample — not the real menu, ingredients, suppliers, or costs of the actual business.
+> sample — not the real menu, ingredients, suppliers, costs, or formulation quantities of the
+> actual business.
 
 ## The case
 

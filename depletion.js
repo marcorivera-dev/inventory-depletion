@@ -147,7 +147,7 @@ function processSales(receipts) {
       }
 
       if (isFrappe) {
-        accumulate(consumption, INGREDIENTS.creamer_non_dairy, 50 * quantity);
+        accumulate(consumption, INGREDIENTS.creamer_non_dairy, 30 * quantity);
       }
     }
   }

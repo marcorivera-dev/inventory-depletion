@@ -8,7 +8,8 @@ Loyverse (POS) — y avisa por WhatsApp antes de que algo se acabe, no después.
 > Extraído de un sistema de inventario más grande (pedidos, cocina, pagos, lealtad). Este repo solo
 > trae la parte de depleción: el modelo receta → insumo, el scheduler nocturno, y la alerta de nivel
 > crítico. El catálogo de recetas e ingredientes en `recipes.js` / `ingredients.js` es de ejemplo —
-> no el menú real, ni los insumos, proveedores o costos reales del negocio.
+> no el menú real, ni los insumos, proveedores, costos o cantidades de formulación reales del
+> negocio.
 
 ## El caso
 
