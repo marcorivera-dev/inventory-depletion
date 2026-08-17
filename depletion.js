@@ -5,18 +5,18 @@ import path from 'path';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '.env') });
 
-import { RECETAS } from './recetas.js';
-import { MAPEO } from './mapeo.js';
-import { INGREDIENTES, MILK_VARIANTS, TEA_VARIANTS } from './ingredientes.js';
+import { RECIPES } from './recipes.js';
+import { ITEM_MAP } from './item-map.js';
+import { INGREDIENTS, MILK_VARIANTS, TEA_VARIANTS } from './ingredients.js';
 
-const MAPEO_LOWER = Object.fromEntries(
-  Object.entries(MAPEO).map(([k, v]) => [k.toLowerCase().trim(), v])
+const ITEM_MAP_LOWER = Object.fromEntries(
+  Object.entries(ITEM_MAP).map(([k, v]) => [k.toLowerCase().trim(), v])
 );
 
 const STORE_ID   = process.env.LOYVERSE_STORE_ID;
 const API_BASE   = 'https://api.loyverse.com/v1.0';
-const LOTE_SIZE  = 20;   // items por batch al POS
-const LOTE_DELAY = 500;  // ms entre batches
+const BATCH_SIZE  = 20;   // items per batch sent to the POS
+const BATCH_DELAY = 500;  // ms between batches
 
 const headers = () => ({
   Authorization: `Bearer ${process.env.LOYVERSE_TOKEN}`,
@@ -24,52 +24,52 @@ const headers = () => ({
 });
 
 // ════════════════════════════════════════════════════════════
-// UTILIDADES
+// UTILITIES
 // ════════════════════════════════════════════════════════════
 
-function getHoyMexicoCity() {
+function getTodayMexicoCity() {
   const now  = new Date();
-  // Mexico City es UTC-6 permanentemente desde 2023 (sin DST)
-  const fecha = now.toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
-  const [y, m, d] = fecha.split('-').map(Number);
-  const inicioUTC = new Date(Date.UTC(y, m - 1, d, 6, 0, 0)); // medianoche MX = 06:00 UTC
-  return { inicio: inicioUTC.toISOString(), fin: now.toISOString(), fecha };
+  // Mexico City is permanently UTC-6 since 2023 (no DST)
+  const date = now.toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+  const [y, m, d] = date.split('-').map(Number);
+  const startUTC = new Date(Date.UTC(y, m - 1, d, 6, 0, 0)); // midnight MX = 06:00 UTC
+  return { start: startUTC.toISOString(), end: now.toISOString(), date };
 }
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-// Busca un modificador por categoría (flexible ante variaciones de nombre)
-function getModificador(lineModifiers, palabrasClave) {
+// Looks up a modifier by category (flexible against naming variations)
+function getModifier(lineModifiers, keywords) {
   for (const mod of (lineModifiers || [])) {
     const cat = (mod.modifier_set_name || mod.name || '').toLowerCase();
     const opt = mod.option || (mod.modifier_set_name ? mod.name : null) || '';
-    for (const palabra of palabrasClave) {
-      if (cat.includes(palabra)) return opt;
+    for (const keyword of keywords) {
+      if (cat.includes(keyword)) return opt;
     }
   }
   return null;
 }
 
-// Acumula consumo en el mapa: uuid → { raw, nombre, factor, unidad, min }
-function acumular(consumo, { uuid, nombre, factor, unidad, min }, rawAmount) {
+// Accumulates consumption in the map: uuid -> { raw, name, factor, unit, min }
+function accumulate(consumption, { uuid, name, factor, unit, min }, rawAmount) {
   if (!uuid || rawAmount <= 0) return;
-  if (!consumo[uuid]) consumo[uuid] = { raw: 0, nombre, factor, unidad, min };
-  consumo[uuid].raw += rawAmount;
+  if (!consumption[uuid]) consumption[uuid] = { raw: 0, name, factor, unit, min };
+  consumption[uuid].raw += rawAmount;
 }
 
 // ════════════════════════════════════════════════════════════
-// PASO 1: LEER VENTAS DEL DÍA
+// STEP 1: READ TODAY'S SALES
 // ════════════════════════════════════════════════════════════
 
-async function leerVentas({ inicio, fin }) {
-  const todos = [];
+async function getDailySales({ start, end }) {
+  const all = [];
   let cursor  = null;
 
   do {
     const params = new URLSearchParams({
       store_id:       STORE_ID,
-      created_at_min: inicio,
-      created_at_max: fin,
+      created_at_min: start,
+      created_at_max: end,
       limit:          '250',
     });
     if (cursor) params.set('cursor', cursor);
@@ -80,90 +80,92 @@ async function leerVentas({ inicio, fin }) {
       throw new Error(`Loyverse receipts ${res.status}: ${txt.slice(0, 200)}`);
     }
     const data = await res.json();
-    const pagina = data.receipts ?? [];
-    todos.push(...pagina);
+    const page = data.receipts ?? [];
+    all.push(...page);
     cursor = data.cursor ?? null;
   } while (cursor);
 
-  return todos;
+  return all;
 }
 
 // ════════════════════════════════════════════════════════════
-// PASO 2: VENTAS → CONSUMO (receta × cantidad, resolviendo leche/té dinámicos)
+// STEP 2: SALES -> CONSUMPTION (recipe × quantity, resolving dynamic milk/tea)
 // ════════════════════════════════════════════════════════════
 
-function procesarVentas(receipts) {
-  const consumo    = {};   // uuid → { raw, nombre, factor, unidad, min }
-  const bebidasLog = {};   // recetaKey → count
-  const sinMapeo   = new Set();
+function processSales(receipts) {
+  const consumption = {};   // uuid -> { raw, name, factor, unit, min }
+  const drinksLog    = {};  // recipeKey -> count
+  const unmapped     = new Set();
 
   for (const receipt of receipts) {
     for (const item of (receipt.line_items || [])) {
-      const nombre   = (item.item_name || '').toLowerCase().trim();
-      const cantidad = item.quantity  || 1;
+      const name     = (item.item_name || '').toLowerCase().trim();
+      const quantity = item.quantity  || 1;
       const mods     = item.line_modifiers || [];
 
-      const recetaKey = MAPEO_LOWER[nombre];
-      if (!recetaKey) {
-        sinMapeo.add(nombre);
+      const recipeKey = ITEM_MAP_LOWER[name];
+      if (!recipeKey) {
+        unmapped.add(name);
         continue;
       }
 
-      const receta = RECETAS[recetaKey];
-      if (!receta) {
-        console.warn(`Receta no encontrada para clave: ${recetaKey}`);
+      const recipe = RECIPES[recipeKey];
+      if (!recipe) {
+        console.warn(`No recipe found for key: ${recipeKey}`);
         continue;
       }
 
-      bebidasLog[recetaKey] = (bebidasLog[recetaKey] || 0) + cantidad;
+      drinksLog[recipeKey] = (drinksLog[recipeKey] || 0) + quantity;
 
-      // Modificadores de leche y té — la receta no fija el ingrediente,
-      // solo la cantidad; cuál variante exacta se descuenta depende de lo
-      // que el cliente eligió en ese pedido.
-      const milkOpt = getModificador(mods, ['leche', 'milk', 'tipo de leche']);
-      const teaOpt  = getModificador(mods, ['te', 'té', 'tea', 'tipo de te', 'tipo de té']);
+      // Milk and tea modifiers — the recipe doesn't fix the ingredient,
+      // only the amount; which exact variant gets deducted depends on
+      // what the customer chose on that order. Keywords are checked in
+      // both English and Spanish since a real POS catalog is rarely
+      // consistently in one language.
+      const milkOpt = getModifier(mods, ['milk', 'leche', 'tipo de leche']);
+      const teaOpt  = getModifier(mods, ['tea', 'te', 'té', 'tipo de te', 'tipo de té']);
       const milkVar = MILK_VARIANTS[milkOpt] ?? MILK_VARIANTS.default;
       const teaVar  = TEA_VARIANTS[teaOpt]   ?? TEA_VARIANTS.default;
 
-      const esFrappe = mods.some(mod => {
+      const isFrappe = mods.some(mod => {
         const cat = (mod.modifier_set_name || '').toLowerCase();
         const opt = (mod.name || '').toLowerCase();
         return cat.includes('frappe') || opt.includes('frappe');
       });
 
-      for (const [ingKey, recipeAmount] of Object.entries(receta)) {
-        const raw = recipeAmount * cantidad;
+      for (const [ingKey, recipeAmount] of Object.entries(recipe)) {
+        const raw = recipeAmount * quantity;
 
-        if (ingKey === 'leche') {
-          acumular(consumo, milkVar, raw);
-        } else if (ingKey === 'te_verde_negro') {
-          acumular(consumo, teaVar, raw);
+        if (ingKey === 'milk') {
+          accumulate(consumption, milkVar, raw);
+        } else if (ingKey === 'tea') {
+          accumulate(consumption, teaVar, raw);
         } else {
-          const ing = INGREDIENTES[ingKey];
-          if (ing) acumular(consumo, ing, raw);
+          const ing = INGREDIENTS[ingKey];
+          if (ing) accumulate(consumption, ing, raw);
         }
       }
 
-      if (esFrappe) {
-        acumular(consumo, INGREDIENTES.creamer_non_dairy, 50 * cantidad);
+      if (isFrappe) {
+        accumulate(consumption, INGREDIENTS.creamer_non_dairy, 50 * quantity);
       }
     }
   }
 
-  if (sinMapeo.size > 0) {
-    console.warn(`⚠️  Productos sin receta mapeada: ${[...sinMapeo].join(', ')}`);
+  if (unmapped.size > 0) {
+    console.warn(`⚠️  Items with no mapped recipe: ${[...unmapped].join(', ')}`);
   }
 
-  return { consumo, bebidasLog };
+  return { consumption, drinksLog };
 }
 
 // ════════════════════════════════════════════════════════════
-// PASO 3: LEER STOCK ACTUAL DEL POS
+// STEP 3: READ CURRENT STOCK FROM THE POS
 // ════════════════════════════════════════════════════════════
 
-async function leerStock() {
-  const niveles = [];
-  let cursor    = null;
+async function getCurrentStock() {
+  const levels = [];
+  let cursor   = null;
 
   do {
     const params = new URLSearchParams({ store_id: STORE_ID, limit: '250' });
@@ -175,22 +177,22 @@ async function leerStock() {
       throw new Error(`Loyverse inventory GET ${res.status}: ${txt.slice(0, 200)}`);
     }
     const data = await res.json();
-    const pagina = data.inventory_levels ?? data.inventory ?? [];
-    niveles.push(...pagina);
+    const page = data.inventory_levels ?? data.inventory ?? [];
+    levels.push(...page);
     cursor = data.cursor ?? null;
   } while (cursor);
 
-  // uuid → in_stock actual
+  // uuid -> current in_stock
   return Object.fromEntries(
-    niveles.map(n => [n.variant_id, n.in_stock ?? 0])
+    levels.map(n => [n.variant_id, n.in_stock ?? 0])
   );
 }
 
 // ════════════════════════════════════════════════════════════
-// PASO 3b: VARIANTS CON TRACK_STOCK ACTIVO
+// STEP 3b: VARIANTS WITH TRACK_STOCK ENABLED
 // ════════════════════════════════════════════════════════════
 
-async function leerVariantsTrackeados() {
+async function getTrackedVariants() {
   const tracked = new Set();
   let cursor    = null;
 
@@ -219,46 +221,46 @@ async function leerVariantsTrackeados() {
 }
 
 // ════════════════════════════════════════════════════════════
-// PASO 4: CALCULAR Y ESCRIBIR EL NUEVO STOCK EN EL POS
+// STEP 4: COMPUTE AND WRITE THE NEW STOCK BACK TO THE POS
 // ════════════════════════════════════════════════════════════
 
-async function actualizarStock(consumo, stockActual, trackeados, fecha) {
-  const updates  = [];
-  const saltados = [];
+async function updateStock(consumption, currentStock, tracked, date) {
+  const updates = [];
+  const skipped  = [];
 
-  for (const [uuid, datos] of Object.entries(consumo)) {
-    if (!trackeados.has(uuid)) {
-      saltados.push(datos.nombre);
+  for (const [uuid, data] of Object.entries(consumption)) {
+    if (!tracked.has(uuid)) {
+      skipped.push(data.name);
       continue;
     }
 
-    const consumidoPOS = datos.raw * datos.factor;
-    const actual = stockActual[uuid] ?? 0;
-    const nuevo  = Math.max(0, actual - consumidoPOS);
+    const consumed = data.raw * data.factor;
+    const current = currentStock[uuid] ?? 0;
+    const updated = Math.max(0, current - consumed);
 
     updates.push({
       variant_id:  uuid,
       store_id:    STORE_ID,
-      stock_after: parseFloat(nuevo.toFixed(4)),
-      reason:      `Depletion automatico ${fecha}`,
-      // metadata para el reporte y la alerta
-      _nombre:     datos.nombre,
-      _consumido:  parseFloat(consumidoPOS.toFixed(4)),
-      _unidad:     datos.unidad,
-      _min:        datos.min,
-      _anterior:   actual,
-      _nuevo:      parseFloat(nuevo.toFixed(4)),
+      stock_after: parseFloat(updated.toFixed(4)),
+      reason:      `Automatic depletion ${date}`,
+      // metadata for the report and the alert
+      _name:      data.name,
+      _consumed:  parseFloat(consumed.toFixed(4)),
+      _unit:      data.unit,
+      _min:       data.min,
+      _before:    current,
+      _after:     parseFloat(updated.toFixed(4)),
     });
   }
 
-  const errores = [];
+  const errors = [];
 
-  // Enviar en lotes de LOTE_SIZE
-  for (let i = 0; i < updates.length; i += LOTE_SIZE) {
-    const lote = updates.slice(i, i + LOTE_SIZE);
+  // Send in batches of BATCH_SIZE
+  for (let i = 0; i < updates.length; i += BATCH_SIZE) {
+    const batch = updates.slice(i, i + BATCH_SIZE);
 
     const body = {
-      inventory_levels: lote.map(u => ({
+      inventory_levels: batch.map(u => ({
         variant_id:  u.variant_id,
         store_id:    u.store_id,
         stock_after: u.stock_after,
@@ -274,102 +276,102 @@ async function actualizarStock(consumo, stockActual, trackeados, fecha) {
       });
       if (!res.ok) {
         const txt = await res.text();
-        errores.push(`Lote ${i / LOTE_SIZE + 1}: HTTP ${res.status} — ${txt.slice(0, 150)}`);
+        errors.push(`Batch ${i / BATCH_SIZE + 1}: HTTP ${res.status} — ${txt.slice(0, 150)}`);
       }
     } catch (err) {
-      errores.push(`Lote ${i / LOTE_SIZE + 1}: ${err.message}`);
+      errors.push(`Batch ${i / BATCH_SIZE + 1}: ${err.message}`);
     }
 
-    if (i + LOTE_SIZE < updates.length) await delay(LOTE_DELAY);
+    if (i + BATCH_SIZE < updates.length) await delay(BATCH_DELAY);
   }
 
-  if (saltados.length > 0) {
-    console.log(`      ⏭️  Saltados (track_stock=false): ${saltados.join(', ')}`);
+  if (skipped.length > 0) {
+    console.log(`      ⏭️  Skipped (track_stock=false): ${skipped.join(', ')}`);
   }
-  if (errores.length > 0) {
-    console.error('Errores al actualizar el POS:', errores);
+  if (errors.length > 0) {
+    console.error('Errors updating the POS:', errors);
   }
 
-  return { updates, errores };
+  return { updates, errors };
 }
 
 // ════════════════════════════════════════════════════════════
-// PASO 5: ALERTA POR WHATSAPP (CallMeBot) CUANDO ALGO CRUZA SU MÍNIMO
+// STEP 5: WHATSAPP ALERT (CallMeBot) WHEN SOMETHING CROSSES ITS MINIMUM
 // ════════════════════════════════════════════════════════════
 
-export async function enviarWhatsApp(texto) {
+export async function sendWhatsApp(text) {
   const phone  = process.env.CALLMEBOT_PHONE;
   const apikey = process.env.CALLMEBOT_APIKEY;
 
   if (!phone || !apikey) {
-    console.log('ℹ️  CALLMEBOT_PHONE / CALLMEBOT_APIKEY no configurados — skip WhatsApp');
+    console.log('ℹ️  CALLMEBOT_PHONE / CALLMEBOT_APIKEY not configured — skipping WhatsApp');
     return;
   }
 
-  const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(phone)}&text=${encodeURIComponent(texto)}&apikey=${encodeURIComponent(apikey)}`;
+  const url = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(phone)}&text=${encodeURIComponent(text)}&apikey=${encodeURIComponent(apikey)}`;
 
   try {
     const res  = await fetch(url);
     const body = await res.text();
     console.log(`WhatsApp HTTP ${res.status}: ${body.slice(0, 200)}`);
-    if (res.ok) console.log('✓ WhatsApp enviado');
+    if (res.ok) console.log('✓ WhatsApp sent');
   } catch (err) {
     console.warn('WhatsApp error:', err.message);
   }
 }
 
-async function enviarAlerta(criticos, fecha) {
-  if (criticos.length === 0) return;
+async function sendCriticalAlert(critical, date) {
+  if (critical.length === 0) return;
 
-  const texto = [
-    `⚠️ Inventario — ${criticos.length} ingrediente${criticos.length > 1 ? 's' : ''} crítico${criticos.length > 1 ? 's' : ''} hoy ${fecha}:`,
-    ...criticos.map(c => `- ${c._nombre}: ${c._nuevo} ${c._unidad} restante`),
+  const text = [
+    `⚠️ Inventory — ${critical.length} critical ingredient${critical.length > 1 ? 's' : ''} today ${date}:`,
+    ...critical.map(c => `- ${c._name}: ${c._after} ${c._unit} left`),
   ].join('\n');
 
-  await enviarWhatsApp(texto);
+  await sendWhatsApp(text);
 }
 
 // ════════════════════════════════════════════════════════════
-// FUNCIÓN PRINCIPAL
+// MAIN FUNCTION
 // ════════════════════════════════════════════════════════════
 
-export async function correrDepletion() {
-  const { inicio, fin, fecha } = getHoyMexicoCity();
-  console.log(`\n🚀 Depletion ${fecha} | ventas de ${inicio} a ${fin}`);
+export async function runDepletion() {
+  const { start, end, date } = getTodayMexicoCity();
+  console.log(`\n🚀 Depletion ${date} | sales from ${start} to ${end}`);
 
-  console.log('  1/5 Leyendo ventas del día...');
-  const receipts = await leerVentas({ inicio, fin });
-  console.log(`      ${receipts.length} recibos encontrados`);
+  console.log('  1/5 Reading today\'s sales...');
+  const receipts = await getDailySales({ start, end });
+  console.log(`      ${receipts.length} receipts found`);
 
-  console.log('  2/5 Procesando ventas → consumo...');
-  const { consumo, bebidasLog } = procesarVentas(receipts);
-  const totalBebidas = Object.values(bebidasLog).reduce((a, b) => a + b, 0);
-  console.log(`      ${totalBebidas} bebidas · ${Object.keys(consumo).length} ingredientes afectados`);
+  console.log('  2/5 Processing sales -> consumption...');
+  const { consumption, drinksLog } = processSales(receipts);
+  const totalDrinks = Object.values(drinksLog).reduce((a, b) => a + b, 0);
+  console.log(`      ${totalDrinks} drinks · ${Object.keys(consumption).length} ingredients affected`);
 
-  if (Object.keys(consumo).length === 0) {
-    console.log('  Sin consumo que reportar. Depletion terminado.\n');
-    return { receipts: receipts.length, bebidas: 0, updates: 0, criticos: 0 };
+  if (Object.keys(consumption).length === 0) {
+    console.log('  Nothing to report. Depletion done.\n');
+    return { receipts: receipts.length, drinks: 0, updates: 0, critical: 0 };
   }
 
-  console.log('  3/5 Leyendo stock actual del POS...');
-  const [stockActual, trackeados] = await Promise.all([leerStock(), leerVariantsTrackeados()]);
+  console.log('  3/5 Reading current stock from the POS...');
+  const [currentStock, tracked] = await Promise.all([getCurrentStock(), getTrackedVariants()]);
 
-  console.log('  4/5 Calculando y actualizando stock...');
-  const { updates, errores } = await actualizarStock(consumo, stockActual, trackeados, fecha);
-  console.log(`      ${updates.length} updates enviados · ${errores.length} errores`);
+  console.log('  4/5 Computing and updating stock...');
+  const { updates, errors } = await updateStock(consumption, currentStock, tracked, date);
+  console.log(`      ${updates.length} updates sent · ${errors.length} errors`);
 
-  const criticos = updates.filter(u => u._nuevo < u._min && u._min > 0);
-  console.log(`  5/5 Verificando críticos (${criticos.length})...`);
-  if (criticos.length > 0) await enviarAlerta(criticos, fecha);
+  const critical = updates.filter(u => u._after < u._min && u._min > 0);
+  console.log(`  5/5 Checking critical levels (${critical.length})...`);
+  if (critical.length > 0) await sendCriticalAlert(critical, date);
 
-  console.log(`\n✅ Depletion completado. Críticos: ${criticos.length}\n`);
+  console.log(`\n✅ Depletion complete. Critical: ${critical.length}\n`);
   return {
     receipts:   receipts.length,
-    bebidas:    totalBebidas,
-    bebidasLog,
+    drinks:     totalDrinks,
+    drinksLog,
     updates:    updates.length,
-    errores:    errores.length,
-    criticos:   criticos.length,
-    criticos_detalle: criticos.map(c => ({ nombre: c._nombre, stock: c._nuevo, min: c._min, unidad: c._unidad })),
+    errors:     errors.length,
+    critical:   critical.length,
+    criticalDetail: critical.map(c => ({ name: c._name, stock: c._after, min: c._min, unit: c._unit })),
   };
 }
