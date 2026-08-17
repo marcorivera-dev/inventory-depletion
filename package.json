@@ -1,0 +1,18 @@
+{
+  "name": "inventory-depletion",
+  "version": "1.0.0",
+  "description": "Descuenta inventario por receta a partir de las ventas de Loyverse y alerta por WhatsApp antes del faltante",
+  "type": "module",
+  "main": "scheduler.js",
+  "scripts": {
+    "start": "node scheduler.js",
+    "depletion": "node -e \"import('./depletion.js').then(m => m.correrDepletion())\""
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-cron": "^4.2.1"
+  }
+}
